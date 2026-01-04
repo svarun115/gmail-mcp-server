@@ -7,3 +7,4 @@ python-dotenv
 dateparser
 fastapi
 uvicorn
+pdfplumber

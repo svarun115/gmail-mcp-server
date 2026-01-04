@@ -1,6 +1,7 @@
 import os.path
 import base64
 import json
+import io
 from typing import List, Optional
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -13,6 +14,7 @@ from fastapi import FastAPI, Request as FastAPIRequest
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 import asyncio
+import pdfplumber
 
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
@@ -107,10 +109,78 @@ def search_emails(query: str = "", sender: str = None, recipient: str = None, su
 
     return "\n".join(output)
 
+def extract_attachments_from_payload(payload: dict, attachments: list = None) -> list:
+    """
+    Recursively extract attachment metadata from email payload.
+    Returns list of attachment info dicts.
+    """
+    if attachments is None:
+        attachments = []
+    
+    # Check if this part is an attachment
+    filename = payload.get('filename', '')
+    if filename:
+        body = payload.get('body', {})
+        attachment_info = {
+            'filename': filename,
+            'mime_type': payload.get('mimeType', 'application/octet-stream'),
+            'size': body.get('size', 0),
+            'attachment_id': body.get('attachmentId', ''),
+        }
+        
+        # Check if PDF might be password protected (we can't know for sure until we try to read it)
+        if attachment_info['mime_type'] == 'application/pdf':
+            attachment_info['protection'] = 'unknown (check when downloading)'
+        else:
+            attachment_info['protection'] = 'none'
+        
+        attachments.append(attachment_info)
+    
+    # Recursively check nested parts
+    if 'parts' in payload:
+        for part in payload['parts']:
+            extract_attachments_from_payload(part, attachments)
+    
+    return attachments
+
+
+def extract_body_from_payload(payload: dict) -> tuple[str, str]:
+    """
+    Recursively extract plain text and HTML body from email payload.
+    Returns (plain_text, html_text) tuple.
+    """
+    plain_text = ""
+    html_text = ""
+    
+    mime_type = payload.get('mimeType', '')
+    
+    # Check if this part has direct body data
+    if 'body' in payload and 'data' in payload['body']:
+        data = payload['body']['data']
+        decoded = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+        
+        if mime_type == 'text/plain':
+            plain_text = decoded
+        elif mime_type == 'text/html':
+            html_text = decoded
+    
+    # Recursively check nested parts
+    if 'parts' in payload:
+        for part in payload['parts']:
+            nested_plain, nested_html = extract_body_from_payload(part)
+            if nested_plain and not plain_text:
+                plain_text = nested_plain
+            if nested_html and not html_text:
+                html_text = nested_html
+    
+    return plain_text, html_text
+
+
 @mcp.tool()
 def get_email_content(email_id: str) -> str:
     """
-    Get the full content of a specific email by ID.
+    Get the full content of a specific email by ID, including attachment metadata.
+    Use get_email_attachment() to download specific attachments.
     
     Args:
         email_id: The Gmail message ID (from search_emails results).
@@ -128,21 +198,40 @@ def get_email_content(email_id: str) -> str:
         date = next((h['value'] for h in headers if h['name'] == 'Date'), 'Unknown Date')
         to = next((h['value'] for h in headers if h['name'] == 'To'), 'Unknown Recipient')
         
-        # Extract body
-        body = ""
-        if 'parts' in payload:
-            for part in payload['parts']:
-                if part['mimeType'] == 'text/plain':
-                    if 'data' in part['body']:
-                        body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
-                        break
-                elif part['mimeType'] == 'text/html' and not body:
-                    if 'data' in part['body']:
-                        html_body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='ignore')
-                        soup = BeautifulSoup(html_body, 'html.parser')
-                        body = soup.get_text()
-        elif 'body' in payload and 'data' in payload['body']:
-            body = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
+        # Extract body recursively
+        plain_text, html_text = extract_body_from_payload(payload)
+        
+        # Prefer plain text, fall back to HTML converted to text
+        if plain_text:
+            body = plain_text
+        elif html_text:
+            soup = BeautifulSoup(html_text, 'html.parser')
+            # Remove script and style elements
+            for element in soup(['script', 'style', 'head']):
+                element.decompose()
+            body = soup.get_text(separator='\n', strip=True)
+        else:
+            # Last resort: use the snippet from the message
+            body = msg.get('snippet', '(No body content available)')
+        
+        # Extract attachment metadata
+        attachments = extract_attachments_from_payload(payload)
+        
+        # Format attachment info
+        if attachments:
+            attachment_lines = [f"\n--- Attachments ({len(attachments)}) ---"]
+            for i, att in enumerate(attachments, 1):
+                size_kb = att['size'] / 1024
+                if size_kb >= 1024:
+                    size_str = f"{size_kb/1024:.1f}MB"
+                else:
+                    size_str = f"{size_kb:.1f}KB"
+                attachment_lines.append(
+                    f"{i}. {att['filename']} | {att['mime_type']} | {size_str} | protection: {att['protection']} | ID: {att['attachment_id']}"
+                )
+            attachment_section = "\n".join(attachment_lines)
+        else:
+            attachment_section = "\n--- Attachments (0) ---\nNo attachments"
         
         return f"""Email ID: {email_id}
 From: {sender}
@@ -151,10 +240,156 @@ Date: {date}
 Subject: {subject}
 
 --- Body ---
-{body}"""
+{body}
+{attachment_section}"""
     
     except Exception as e:
         return f"Error fetching email {email_id}: {str(e)}"
+
+
+@mcp.tool()
+def get_email_attachment(email_id: str, attachment_id: str, password: str = None) -> str:
+    """
+    Download and read an email attachment. For PDFs, extracts text content.
+    For other files, returns base64-encoded content.
+    
+    Args:
+        email_id: The Gmail message ID.
+        attachment_id: The attachment ID (from get_email_content results).
+        password: Optional password for password-protected PDF files.
+    """
+    service = get_gmail_service()
+    
+    try:
+        # Get the original message to find the filename and mime type first
+        msg = service.users().messages().get(userId='me', id=email_id, format='full').execute()
+        attachments = extract_attachments_from_payload(msg['payload'])
+        
+        # Find the matching attachment metadata
+        attachment_info = None
+        for att in attachments:
+            if att['attachment_id'] == attachment_id:
+                attachment_info = att
+                break
+        
+        # If not found by exact match, try to find by position (fallback)
+        if not attachment_info and attachments:
+            # Use first attachment if only one exists
+            if len(attachments) == 1:
+                attachment_info = attachments[0]
+                attachment_id = attachment_info['attachment_id']
+        
+        if not attachment_info:
+            return f"Error: Attachment with ID {attachment_id} not found in email. Available attachments: {[a['filename'] for a in attachments]}"
+        
+        filename = attachment_info['filename']
+        mime_type = attachment_info['mime_type']
+        
+        # Get the attachment data
+        attachment = service.users().messages().attachments().get(
+            userId='me',
+            messageId=email_id,
+            id=attachment_id
+        ).execute()
+        
+        # Decode the attachment data
+        file_data = base64.urlsafe_b64decode(attachment['data'])
+        
+        # Handle PDF files - extract text
+        if mime_type == 'application/pdf':
+            try:
+                pdf_file = io.BytesIO(file_data)
+                text_content = []
+                
+                # pdfplumber expects password as string, not bytes
+                pdf_password = password if password else None
+                
+                with pdfplumber.open(pdf_file, password=pdf_password) as pdf:
+                    for i, page in enumerate(pdf.pages, 1):
+                        page_text = page.extract_text()
+                        if page_text:
+                            text_content.append(f"--- Page {i} ---\n{page_text}")
+                
+                if text_content:
+                    extracted_text = "\n\n".join(text_content)
+                    return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+Protection: {'password-protected' if password else 'none'}
+
+--- Extracted Text ---
+{extracted_text}"""
+                else:
+                    return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+
+Note: PDF contains no extractable text (may be image-based or scanned document)."""
+                    
+            except Exception as pdf_error:
+                error_msg = str(pdf_error).lower()
+                if 'password' in error_msg or 'encrypted' in error_msg:
+                    return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+Protection: password-protected
+
+Error: This PDF is password-protected. Please provide the password parameter to extract text."""
+                else:
+                    return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+
+Error extracting PDF text: {str(pdf_error)}
+
+Falling back to base64 content (first 1000 chars):
+{base64.b64encode(file_data).decode()[:1000]}..."""
+        
+        # Handle text-based files
+        elif mime_type.startswith('text/') or mime_type in ['application/json', 'application/xml']:
+            try:
+                text_content = file_data.decode('utf-8', errors='ignore')
+                return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+
+--- Content ---
+{text_content}"""
+            except:
+                pass
+        
+        # Handle image files - return base64 for potential display
+        elif mime_type.startswith('image/'):
+            b64_content = base64.b64encode(file_data).decode()
+            return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+
+--- Base64 Content (for display) ---
+data:{mime_type};base64,{b64_content}"""
+        
+        # For other binary files, return base64 with size limit
+        else:
+            b64_content = base64.b64encode(file_data).decode()
+            if len(b64_content) > 10000:
+                return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+
+--- Base64 Content (truncated, first 10000 chars) ---
+{b64_content[:10000]}...
+
+Note: Full content truncated. Total base64 length: {len(b64_content)} chars"""
+            else:
+                return f"""Attachment: {filename}
+Type: {mime_type}
+Size: {len(file_data)} bytes
+
+--- Base64 Content ---
+{b64_content}"""
+    
+    except Exception as e:
+        return f"Error fetching attachment {attachment_id} from email {email_id}: {str(e)}"
 
 @mcp.tool()
 def get_swiggy_orders(start_date: str = None, end_date: str = None, limit: int = 10) -> str:
@@ -257,13 +492,26 @@ async def mcp_handler(request: FastAPIRequest):
                         },
                         {
                             "name": "get_email_content",
-                            "description": "Get the full content of a specific email by ID.",
+                            "description": "Get the full content of a specific email by ID, including attachment metadata. Use get_email_attachment() to download specific attachments.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "email_id": {"type": "string", "description": "The Gmail message ID (from search_emails results)."}
                                 },
                                 "required": ["email_id"]
+                            }
+                        },
+                        {
+                            "name": "get_email_attachment",
+                            "description": "Download and read an email attachment. For PDFs, extracts text content. For other files, returns base64-encoded content.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "email_id": {"type": "string", "description": "The Gmail message ID."},
+                                    "attachment_id": {"type": "string", "description": "The attachment ID (from get_email_content results)."},
+                                    "password": {"type": "string", "description": "Optional password for password-protected PDF files."}
+                                },
+                                "required": ["email_id", "attachment_id"]
                             }
                         },
                         {
@@ -291,6 +539,8 @@ async def mcp_handler(request: FastAPIRequest):
                 result = search_emails(**arguments)
             elif tool_name == "get_email_content":
                 result = get_email_content(**arguments)
+            elif tool_name == "get_email_attachment":
+                result = get_email_attachment(**arguments)
             elif tool_name == "get_swiggy_orders":
                 result = get_swiggy_orders(**arguments)
             else:

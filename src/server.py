@@ -391,72 +391,6 @@ Size: {len(file_data)} bytes
     except Exception as e:
         return f"Error fetching attachment {attachment_id} from email {email_id}: {str(e)}"
 
-@mcp.tool()
-def get_swiggy_orders(start_date: str = None, end_date: str = None, limit: int = 10) -> str:
-    """
-    Fetch and parse Swiggy order receipts from Gmail.
-    
-    Args:
-        start_date: Filter orders after this date (inclusive).
-        end_date: Filter orders before this date (exclusive).
-        limit: Maximum number of orders to return.
-    """
-    service = get_gmail_service()
-    # Swiggy order emails usually come from 'no-reply@swiggy.in' with subject containing 'Order'
-    query_parts = ['from:no-reply@swiggy.in', 'subject:"Order delivered"']
-    
-    if start_date:
-        dt = dateparser.parse(start_date)
-        if dt:
-            query_parts.append(f"after:{dt.strftime('%Y/%m/%d')}")
-            
-    if end_date:
-        dt = dateparser.parse(end_date)
-        if dt:
-            query_parts.append(f"before:{dt.strftime('%Y/%m/%d')}")
-            
-    query = " ".join(query_parts)
-    
-    results = service.users().messages().list(userId='me', q=query, maxResults=limit).execute()
-    messages = results.get('messages', [])
-
-    if not messages:
-        return "No Swiggy orders found."
-
-    orders = []
-    for message in messages:
-        try:
-            msg = service.users().messages().get(userId='me', id=message['id']).execute()
-            payload = msg['payload']
-            
-            # Get HTML body
-            body = ""
-            if 'parts' in payload:
-                for part in payload['parts']:
-                    if part['mimeType'] == 'text/html':
-                        data = part['body']['data']
-                        body = base64.urlsafe_b64decode(data).decode()
-                        break
-            elif 'body' in payload and 'data' in payload['body']:
-                data = payload['body']['data']
-                body = base64.urlsafe_b64decode(data).decode()
-
-            if body:
-                soup = BeautifulSoup(body, 'html.parser')
-                # Basic parsing logic - this will need to be refined based on actual email structure
-                # This is a placeholder for the parsing logic
-                text_content = soup.get_text()
-                
-                # Extract date from headers
-                headers = msg['payload']['headers']
-                date_str = next((h['value'] for h in headers if h['name'] == 'Date'), '')
-                
-                orders.append(f"Order ID: {message['id']} | Date: {date_str} | Content Preview: {text_content[:100]}...")
-        except Exception as e:
-            orders.append(f"Error parsing message {message['id']}: {str(e)}")
-
-    return "\n".join(orders)
-
 @app.post("/mcp")
 async def mcp_handler(request: FastAPIRequest):
     """Handle MCP requests over HTTP"""
@@ -513,18 +447,6 @@ async def mcp_handler(request: FastAPIRequest):
                                 },
                                 "required": ["email_id", "attachment_id"]
                             }
-                        },
-                        {
-                            "name": "get_swiggy_orders",
-                            "description": "Fetch and parse Swiggy order receipts from Gmail.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "start_date": {"type": "string", "description": "Filter orders after this date (inclusive)."},
-                                    "end_date": {"type": "string", "description": "Filter orders before this date (exclusive)."},
-                                    "limit": {"type": "integer", "description": "Maximum number of orders to return."}
-                                }
-                            }
                         }
                     ]
                 }
@@ -541,8 +463,6 @@ async def mcp_handler(request: FastAPIRequest):
                 result = get_email_content(**arguments)
             elif tool_name == "get_email_attachment":
                 result = get_email_attachment(**arguments)
-            elif tool_name == "get_swiggy_orders":
-                result = get_swiggy_orders(**arguments)
             else:
                 return JSONResponse({
                     "jsonrpc": "2.0",
